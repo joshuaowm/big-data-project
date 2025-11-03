@@ -149,15 +149,6 @@ def main():
             dist.select("*").show(5, truncate=False)
     
     print("\nAnalysis complete!")
-    
-    # Optional: Save results to S3
-    # Uncomment if you want to save results
-    # output_path = "s3a://ubs-datasets/FRACTAL/analysis_results/"
-    # for dataset_type, dist in distributions.items():
-    #     if dist:
-    #         dist.write.mode("overwrite").parquet(
-    #             f"{output_path}{dataset_type}_distribution.parquet"
-    #         )
 
 if __name__ == "__main__":
     main()
