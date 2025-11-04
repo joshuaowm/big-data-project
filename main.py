@@ -21,9 +21,9 @@ import numpy as np
 # on an AWS cluster launch it directly with :
 # spark-submit --master yarn load_parquet_files.py
 
-default_train_files = "s3a://ubs-datasets/FRACTAL/data/train/*"
-default_valid_files = "s3a://ubs-datasets/FRACTAL/data/valid/*"
-default_test_files = "s3a://ubs-datasets/FRACTAL/data/test/*"
+train_files = "s3a://ubs-datasets/FRACTAL/data/train/*"
+valid_files = "s3a://ubs-datasets/FRACTAL/data/valid/*"
+test_files = "s3a://ubs-datasets/FRACTAL/data/test/*"
 
 default_parq_file="s3a://ubs-datasets/FRACTAL/data/test/TEST-1176_6137-009200000.parquet"
 
@@ -36,9 +36,6 @@ def calculate_ndvi(red, infrared):
     return float((infrared - red) / (infrared + red)) if (infrared + red) != 0 else 0.0
 
 def main(args):
-    train_files = args.train
-    valid_files = args.valid
-    test_files = args.test
     executor_mem = args.executor_mem
     driver_mem = args.driver_mem
 
@@ -54,15 +51,15 @@ def main(args):
     
     taskmetrics = TaskMetrics(spark)
     
-    parq_cols = ["xyz", "Intensity", "Classification", "Red", "Green", "Blue", "Infrared"]
+    # parq_cols = ["xyz", "Intensity", "Classification", "Red", "Green", "Blue", "Infrared"]
     
-    taskmetrics.begin()
+    # taskmetrics.begin()
     # df_train = spark.read.parquet(default_test_files).select(*parq_cols).cache()
     df_train = read_parquet_from_s3(spark, default_parq_file)
-    taskmetrics.end()
-    print("\n============< Read Parquet Statistics >============\n")
-    taskmetrics.print_report()
-    print("\n=====================================================\n")
+    # taskmetrics.end()
+    # print("\n============< Read Parquet Statistics >============\n")
+    # taskmetrics.print_report()
+    # print("\n=====================================================\n")
     
         
     # Register user defined fonction for NDVI calculation
@@ -75,9 +72,14 @@ def main(args):
         .withColumn("z", col("xyz")[2]) \
         .withColumn("ndvi", ndvi_udf(col("Red"), col("Infrared")))
 
+    # Drop rows with null values in essential columns
+    df_train = df_train.na.drop(subset=["x", "y", "z", "Intensity", "ndvi", "Red", "Green", "Blue", "Infrared", "Classification"])
+    
     # Show schema and sample data
+    print("\n============< Training Data Sample >============\n")
     df_train.printSchema()
-    df_train.show(5, truncate=False)
+    df_train.show(5)
+    print("===============================================\n")
 
     # Assemble features
     feature_cols = ["x", "y", "z", "Intensity", "ndvi", "Red", "Green", "Blue", "Infrared"]
