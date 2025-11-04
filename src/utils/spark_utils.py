@@ -4,7 +4,7 @@ from pyspark.sql import SparkSession
 
 load_dotenv()
 
-def create_spark_session(app_name: str = "Spark Application") -> SparkSession:
+def create_spark_session(app_name, executor_mem, driver_mem) -> SparkSession:
     """
     Initializes and configures a SparkSession for S3 access.
 
@@ -24,6 +24,8 @@ def create_spark_session(app_name: str = "Spark Application") -> SparkSession:
 
     spark = SparkSession.builder \
         .appName(app_name) \
+        .config("spark.hadoop.fs.s3a.fast.upload", "true") \
+        .config("spark.hadoop.fs.s3a.multipart.size", "104857600") \
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
         .config("spark.hadoop.fs.s3a.access.key", s3_access_key) \
         .config("spark.hadoop.fs.s3a.secret.key", s3_secret_key) \
@@ -32,6 +34,8 @@ def create_spark_session(app_name: str = "Spark Application") -> SparkSession:
         .config("spark.hadoop.fs.s3a.threads.keepalivetime", "60000") \
         .config("spark.hadoop.fs.s3a.multipart.purge.age", "30000000") \
         .config("spark.hadoop.fs.s3a.connection.establish.timeout", "30000") \
+        .config("spark.executor.memory", executor_mem) \
+        .config("spark.driver.memory", driver_mem) \
         .getOrCreate()
         
     spark.sparkContext.setLogLevel("WARN")
