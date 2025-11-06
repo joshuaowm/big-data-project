@@ -163,7 +163,7 @@ def main(args):
     # Register user defined fonction for NDVI calculation
     ndvi_udf = udf(calculate_ndvi, DoubleType())
 
-    # Extract features: x, y, z, intensity, NDVI, RGB, Infrared
+    # Extract x, y, z from xyz array
     df_train = df_train \
         .withColumn("x", col("xyz")[0]) \
         .withColumn("y", col("xyz")[1]) \
@@ -177,25 +177,12 @@ def main(args):
     print("\n============< Neighbor Features >============")
     df_train = compute_neighbor_features(df_train, radius=2.0)
 
-    # Continue with NDVI
+    # Add ndvi column
     df_train = df_train.withColumn("ndvi", ndvi_udf(col("Red"), col("Infrared")))
     
-    # Extract features: x, y, z, intensity, NDVI, RGB, Infrared
-    # df_train = df_train \
-    #     .withColumn("x", col("xyz")[0]) \
-    #     .withColumn("y", col("xyz")[1]) \
-    #     .withColumn("z", col("xyz")[2]) \
-    #     .withColumn("ndvi", ndvi_udf(col("Red"), col("Infrared")))
-
     # Drop rows with null values in essential columns
     df_train = df_train.na.drop(subset=["x", "y", "z", "Intensity", "ndvi", "Red", "Green", "Blue", "Infrared", "Classification"])
     
-    # Show schema and sample data
-    print("\n============< Training Data Sample >============\n")
-    df_train.printSchema()
-    df_train.show(5)
-    print("===============================================\n")
-
     # Assemble features
     feature_cols = ["x", "y", "z", "z_normalized", "Intensity", "ndvi", 
                 "Red", "Green", "Blue", "Infrared", 
