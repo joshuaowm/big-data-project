@@ -1,15 +1,16 @@
 from src.utils.spark_utils import create_spark_session, read_parquet_from_s3
 
-from pyspark.sql.functions import col, udf, array
+from pyspark.sql.functions import col, udf, array, min as spark_min
 from pyspark.sql.types import DoubleType, StructType, StructField, ArrayType, FloatType, ShortType
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.ml.classification import RandomForestClassifier
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from sparkmeasure import TaskMetrics
-import argparse
+from pyspark.sql.window import Window
 import numpy as np
-
+from scipy.spatial import KDTree
+import argparse
 
 # To be able to read or write files on S3 from your LOCAL PC you need to launch it this way:
 # spark-submit --master local[*] --packages org.apache.hadoop:hadoop-aws:3.3.1 load_parquet_files.py
@@ -27,9 +28,106 @@ test_files = "s3a://ubs-datasets/FRACTAL/data/test/*"
 
 default_parq_file="s3a://ubs-datasets/FRACTAL/data/test/TEST-1176_6137-009200000.parquet"
 
-
 default_executor_mem = "4g"
 default_driver_mem = "4g"
+
+def normalize_height(df):
+    """
+    Normalize height by subtracting the global minimum z value.
+    Simple and fast approach.
+    
+    Parameters:
+    -----------
+    df : pyspark.sql.DataFrame
+        DataFrame with 'z' column
+    
+    Returns:
+    --------
+    df : pyspark.sql.DataFrame
+        DataFrame with additional 'z_normalized' column
+    """
+    # Find global minimum z
+    min_z = df.agg(spark_min("z")).collect()[0][0]
+    print(f"Minimum z value: {min_z:.2f}")
+    
+    # Subtract minimum from all z values
+    df = df.withColumn("z_normalized", col("z") - min_z)
+    
+    return df
+
+def compute_neighbor_features(df, radius=2.0):
+    """
+    Compute basic neighbor statistics using KDTree.
+    
+    Parameters:
+    -----------
+    df : pyspark.sql.DataFrame
+        DataFrame with x, y, z columns
+    radius : float
+        Search radius for neighbors (in meters)
+    
+    Returns:
+    --------
+    df : pyspark.sql.DataFrame
+        DataFrame with additional columns:
+        - neighbor_count: number of neighbors within radius
+        - z_std_local: standard deviation of z in neighborhood
+    """
+    print(f"Computing neighbor features with radius={radius}m...")
+    
+    # Collect points for KDTree
+    points_data = df.select("x", "y", "z").collect()
+    points = np.array([[row.x, row.y, row.z] for row in points_data])
+    
+    print(f"Building KDTree for {len(points)} points...")
+    
+    # Build KDTree on x,y coordinates only
+    xy_coords = points[:, :2]
+    tree = KDTree(xy_coords)
+    
+    # Compute features for each point
+    neighbor_counts = []
+    z_stds = []
+    
+    for i, (x, y, z) in enumerate(points):
+        # Find neighbors within radius
+        indices = tree.query_ball_point([x, y], radius)
+        
+        # Get neighbor count
+        n_neighbors = len(indices)
+        neighbor_counts.append(n_neighbors)
+        
+        # Get z standard deviation in neighborhood
+        if n_neighbors > 1:
+            z_values = points[indices, 2]
+            z_std = float(np.std(z_values))
+        else:
+            z_std = 0.0
+        z_stds.append(z_std)
+        
+        # Progress indicator
+        if (i + 1) % 10000 == 0:
+            print(f"Processed {i + 1}/{len(points)} points...")
+    
+    print("KDTree computation complete!")
+    
+    # Add row IDs for joining
+    from pyspark.sql.functions import monotonically_increasing_id
+    from pyspark.sql import Row
+    
+    df_with_id = df.withColumn("row_id", monotonically_increasing_id())
+    
+    # Create DataFrame with neighbor features
+    feature_rows = [
+        Row(row_id=i, neighbor_count=nc, z_std_local=zs)
+        for i, (nc, zs) in enumerate(zip(neighbor_counts, z_stds))
+    ]
+    feature_df = df.sparkSession.createDataFrame(feature_rows)
+    
+    # Join back to original DataFrame
+    df_result = df_with_id.join(feature_df, "row_id").drop("row_id")
+    
+    return df_result
 
 def calculate_ndvi(red, infrared):
     """Calculate NDVI from red and infrared bands."""
@@ -69,8 +167,25 @@ def main(args):
     df_train = df_train \
         .withColumn("x", col("xyz")[0]) \
         .withColumn("y", col("xyz")[1]) \
-        .withColumn("z", col("xyz")[2]) \
-        .withColumn("ndvi", ndvi_udf(col("Red"), col("Infrared")))
+        .withColumn("z", col("xyz")[2])
+
+    # Apply height normalization
+    print("\n============< Height Normalization >============")
+    df_train = normalize_height(df_train)
+
+    # Apply neighbor feature computation
+    print("\n============< Neighbor Features >============")
+    df_train = compute_neighbor_features(df_train, radius=2.0)
+
+    # Continue with NDVI
+    df_train = df_train.withColumn("ndvi", ndvi_udf(col("Red"), col("Infrared")))
+    
+    # Extract features: x, y, z, intensity, NDVI, RGB, Infrared
+    # df_train = df_train \
+    #     .withColumn("x", col("xyz")[0]) \
+    #     .withColumn("y", col("xyz")[1]) \
+    #     .withColumn("z", col("xyz")[2]) \
+    #     .withColumn("ndvi", ndvi_udf(col("Red"), col("Infrared")))
 
     # Drop rows with null values in essential columns
     df_train = df_train.na.drop(subset=["x", "y", "z", "Intensity", "ndvi", "Red", "Green", "Blue", "Infrared", "Classification"])
@@ -82,7 +197,10 @@ def main(args):
     print("===============================================\n")
 
     # Assemble features
-    feature_cols = ["x", "y", "z", "Intensity", "ndvi", "Red", "Green", "Blue", "Infrared"]
+    feature_cols = ["x", "y", "z", "z_normalized", "Intensity", "ndvi", 
+                "Red", "Green", "Blue", "Infrared", 
+                "neighbor_count", "z_std_local"]    
+    
     assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
 
     # Standardize features
