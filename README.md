@@ -15,6 +15,11 @@ To set up the environment, follow these steps:
    ```
 
 3. **Run the application**: Use the provided scripts to run your Spark jobs.
+OR here is an example of running a Spark job:
+
+   ```bash
+   spark-submit --master yarn --deploy-mode cluster --executor-cores=7 --num-executors=55 --executor-memory=18GB optimized.py 
+   ```
 
 ## Project Structure
 

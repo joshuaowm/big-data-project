@@ -1,4 +1,60 @@
-from src.utils.spark_utils import create_spark_session, read_parquet_from_s3
+import os
+from pyspark.sql import SparkSession
+
+def create_spark_session(app_name) -> SparkSession:
+    """
+    Initializes and configures a SparkSession for S3 access.
+
+    Args:
+        app_name (str): The name for the Spark application.
+
+    Returns:
+        SparkSession: The configured SparkSession.
+    """
+
+    spark = SparkSession.builder \
+        .appName(app_name) \
+        .config("spark.hadoop.fs.s3a.fast.upload", "true") \
+        .config("spark.hadoop.fs.s3a.multipart.size", "104857600") \
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .config("spark.hadoop.fs.s3a.access.key", "access_key") \
+        .config("spark.hadoop.fs.s3a.secret.key", "secret_key") \
+        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider") \
+        .config("spark.hadoop.fs.s3a.connection.timeout", "50000") \
+        .config("spark.hadoop.fs.s3a.threads.keepalivetime", "60000") \
+        .config("spark.hadoop.fs.s3a.multipart.purge.age", "30000000") \
+        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "30000") \
+        .config("spark.master", "yarn") \
+        .config("spark.submit.deployMode", "cluster") \
+        .config("spark.executor.instances", "16") \
+        .config("spark.executor.memory", "4g") \
+        .config("spark.executor.cores", "5") \
+        .getOrCreate()
+        
+    spark.sparkContext.setLogLevel("WARN")
+    
+    return spark
+
+def read_parquet_from_s3(spark: SparkSession, s3_path: str, fraction: float = 0.05):
+    """
+    Reads a Parquet file from a given S3 path into a Spark DataFrame and returns a fraction of the data.
+
+    Args:
+        spark (SparkSession): The active SparkSession.
+        s3_path (str): The full s3a:// path to the Parquet file or directory.
+        fraction (float, optional): Fraction of the data to return (0.0 to 1.0). Defaults to 0.05 (5%).
+
+    Returns:
+        pyspark.sql.DataFrame: The loaded DataFrame (or a fraction of it).
+    """
+    print(f"Reading Parquet file from: {s3_path}")
+    df = spark.read.parquet(s3_path)
+
+    if fraction < 1.0:
+        print(f"Returning {fraction * 100}% of the data")
+        df = df.sample(fraction, seed=42)
+
+    return df
 
 from pyspark.sql.functions import (
     col, udf, array, min as spark_min, max as spark_max, 
@@ -14,13 +70,10 @@ from sparkmeasure import TaskMetrics
 import argparse
 
 # Configuration
-train_files = "s3a://ubs-datasets/FRACTAL/data/train/*"
-valid_files = "s3a://ubs-datasets/FRACTAL/data/valid/*"
-test_files = "s3a://ubs-datasets/FRACTAL/data/test/*"
+train_files = "s3a://ubs-datasets/FRACTAL/data/train/"
+valid_files = "s3a://ubs-datasets/FRACTAL/data/valid/"
+test_files = "s3a://ubs-datasets/FRACTAL/data/test/"
 default_parq_file = "s3a://ubs-datasets/FRACTAL/data/test/TEST-1176_6137-009200000.parquet"
-
-default_executor_mem = "4g"
-default_driver_mem = "4g"
 
 def normalize_height(df):
     """
@@ -271,11 +324,7 @@ def build_ml_pipeline(feature_cols, num_trees=100, max_depth=10, use_cv=False):
         labelCol="Classification",
         numTrees=num_trees,
         maxDepth=max_depth,
-        maxBins=64,  # Increased for better splits
-        minInstancesPerNode=10,  # Prevent overfitting
-        subsamplingRate=0.8,  # Bootstrap sampling
         seed=42,
-        featureSubsetStrategy="sqrt"  # Standard for classification
     )
     
     pipeline = Pipeline(stages=[assembler, scaler, rf])
@@ -346,8 +395,6 @@ def evaluate_model(predictions, spark):
     class_metrics.show()
 
 def main(args):
-    executor_mem = args.executor_mem
-    driver_mem = args.driver_mem
     grid_size = args.grid_size
     num_trees = args.num_trees
     max_depth = args.max_depth
@@ -358,8 +405,6 @@ def main(args):
     print(f"Train files: {train_files}")
     print(f"Valid files: {valid_files}")
     print(f"Test files: {test_files}")
-    print(f"Executor memory: {executor_mem}")
-    print(f"Driver memory: {driver_mem}")
     print(f"Grid size: {grid_size}m")
     print(f"Random Forest trees: {num_trees}")
     print(f"Max depth: {max_depth}")
@@ -367,9 +412,7 @@ def main(args):
 
     # Create Spark session
     spark = create_spark_session(
-        app_name="Land Cover Classification", 
-        executor_mem=executor_mem, 
-        driver_mem=driver_mem
+        app_name="Land Cover Classification"
     )
         
     # taskmetrics = TaskMetrics(spark)
@@ -380,10 +423,12 @@ def main(args):
     print("="*50)
     
     # taskmetrics.begin()
-    df_train = read_parquet_from_s3(spark, args.input)
+    df_train = read_parquet_from_s3(spark, train_files, fraction=0.05)
+    # df_test = read_parquet_from_s3(spark, test_files, fraction=0.1)
     
     # Cache after loading for reuse
     df_train = df_train.cache()
+    # df_test = df_test.cache()
     row_count = df_train.count()
     # taskmetrics.end()
     
@@ -455,10 +500,10 @@ def main(args):
     print("Making Predictions")
     print("="*50)
     
+    # Evaluate model
+    
     predictions = model.transform(df_train)
     predictions = predictions.cache()
-    
-    # Evaluate model
     evaluate_model(predictions, spark)
     
     # Classification map
@@ -494,24 +539,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description="Optimized PySpark Land Cover Classification"
     )
-    parser.add_argument(
-        "--input", 
-        required=False, 
-        help="Input parquet file(s)",
-        default=default_parq_file
-    )
-    parser.add_argument(
-        "--executor-mem",
-        required=False, 
-        help="Executor memory",
-        default=default_executor_mem
-    )
-    parser.add_argument(
-        "--driver-mem",
-        required=False, 
-        help="Driver memory",
-        default=default_driver_mem
-    )
+
     parser.add_argument(
         "--grid-size",
         type=float,
