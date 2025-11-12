@@ -1,61 +1,7 @@
 import os
+import sys
 from pyspark.sql import SparkSession
-
-def create_spark_session(app_name) -> SparkSession:
-    """
-    Initializes and configures a SparkSession for S3 access.
-
-    Args:
-        app_name (str): The name for the Spark application.
-
-    Returns:
-        SparkSession: The configured SparkSession.
-    """
-
-    spark = SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.hadoop.fs.s3a.fast.upload", "true") \
-        .config("spark.hadoop.fs.s3a.multipart.size", "104857600") \
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-        .config("spark.hadoop.fs.s3a.access.key", "access_key") \
-        .config("spark.hadoop.fs.s3a.secret.key", "secret_key") \
-        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider") \
-        .config("spark.hadoop.fs.s3a.connection.timeout", "50000") \
-        .config("spark.hadoop.fs.s3a.threads.keepalivetime", "60000") \
-        .config("spark.hadoop.fs.s3a.multipart.purge.age", "30000000") \
-        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "30000") \
-        .config("spark.master", "yarn") \
-        .config("spark.submit.deployMode", "cluster") \
-        .config("spark.executor.instances", "16") \
-        .config("spark.executor.memory", "4g") \
-        .config("spark.executor.cores", "5") \
-        .getOrCreate()
-        
-    spark.sparkContext.setLogLevel("WARN")
-    
-    return spark
-
-def read_parquet_from_s3(spark: SparkSession, s3_path: str, fraction: float = 0.05):
-    """
-    Reads a Parquet file from a given S3 path into a Spark DataFrame and returns a fraction of the data.
-
-    Args:
-        spark (SparkSession): The active SparkSession.
-        s3_path (str): The full s3a:// path to the Parquet file or directory.
-        fraction (float, optional): Fraction of the data to return (0.0 to 1.0). Defaults to 0.05 (5%).
-
-    Returns:
-        pyspark.sql.DataFrame: The loaded DataFrame (or a fraction of it).
-    """
-    print(f"Reading Parquet file from: {s3_path}")
-    df = spark.read.parquet(s3_path)
-
-    if fraction < 1.0:
-        print(f"Returning {fraction * 100}% of the data")
-        df = df.sample(fraction, seed=42)
-
-    return df
-
+import logging
 from pyspark.sql.functions import (
     col, udf, array, min as spark_min, max as spark_max, 
     avg, stddev, count, lit, expr, row_number, broadcast
@@ -68,12 +14,147 @@ from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
 from sparkmeasure import TaskMetrics
 import argparse
+from pathlib import Path
+from datetime import datetime
+
+
+def create_spark_session(args):
+    """Create and configure Spark session"""
+    app_name = args.experiment_name or f"fractal-rf-e{args.executor_memory}g-x{args.num_executors}-f{args.sample_fraction}"
+    
+    logger.info(f"Creating Spark session: {app_name}")
+    builder = SparkSession.builder.appName(app_name)
+
+    if args.master:
+        builder = builder.master(args.master)
+        logger.info(f"Spark master: {args.master}")
+
+    builder = (
+        builder.config(
+            "spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem"
+        )
+        .config(
+            "spark.hadoop.fs.s3a.aws.credentials.provider",
+            "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
+        )
+        .config("spark.executor.memory", f"{args.executor_memory}g")
+        .config("spark.executor.cores", str(args.executor_cores))
+        .config("spark.driver.memory", f"{args.driver_memory}g")
+        .config("spark.driver.maxResultSize", "512m")
+        .config("spark.executor.instances", str(args.num_executors))
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        .config("spark.sql.shuffle.partitions", str((args.executor_cores * args.num_executors) * 4))
+        .config("spark.sql.files.maxPartitionBytes", "268435456")  # 256MB
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "134217728")  # 128MB
+        .config("spark.hadoop.fs.s3a.connection.timeout", "50000") \
+        .config("spark.hadoop.fs.s3a.threads.keepalivetime", "60000") \
+        .config("spark.hadoop.fs.s3a.multipart.purge.age", "30000000") \
+        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "30000") \
+    )
+
+    if args.enable_stage_metrics:
+        builder = builder.config("spark.eventLog.enabled", "true").config(
+            "spark.eventLog.dir", args.event_log_dir
+        )
+        logger.info("Stage metrics enabled")
+
+    session = builder.getOrCreate()
+    logger.info(f"Spark session created successfully : executors={args.num_executors}, cores={args.executor_cores}, memory={args.executor_memory}g, fraction={args.sample_fraction}")
+
+    return session
 
 # Configuration
 train_files = "s3a://ubs-datasets/FRACTAL/data/train/"
 valid_files = "s3a://ubs-datasets/FRACTAL/data/valid/"
 test_files = "s3a://ubs-datasets/FRACTAL/data/test/"
 default_parq_file = "s3a://ubs-datasets/FRACTAL/data/test/TEST-1176_6137-009200000.parquet"
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(args):
+    """Setup logging configuration"""
+    safe_dir = Path("/tmp/spark-events")
+    safe_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_name = args.experiment_name or f"fractal-rf-e{args.executor_memory}g-x{args.num_executors}-f{args.sample_fraction}"
+    log_file = safe_dir / f"{log_name}_{timestamp}.log"
+
+    command_line = ' '.join(sys.argv)
+    with open(log_file, 'w') as f:
+        f.write(f"Command: {command_line}\n")
+        f.write("=" * 60 + "\n\n")
+
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', '%Y-%m-%d %H:%M:%S')
+    for handler in [logging.StreamHandler(), logging.FileHandler(log_file)]:
+        handler.setFormatter(fmt)
+        logger.addHandler(handler)
+
+    logger.info(f"Logging to: {log_file}")
+    return log_file
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-n", "--experiment-name", default=None, help="Experiment name for Spark app")
+    parser.add_argument("-m", "--master", default=None, help="Spark master URL")
+    parser.add_argument("-e", "--executor-memory", type=int, default=8, help="Executor memory in GB")
+    parser.add_argument("-d", "--driver-memory", type=int, default=2, help="Driver memory in GB")
+    parser.add_argument("-c", "--executor-cores", type=int, default=2, help="Executor cores")
+    parser.add_argument("-x", "--num-executors", type=int, default=2, help="Number of executors")
+    parser.add_argument("-p", "--data", dest="data_path", default="/opt/spark/work-dir/data/FRACTAL", help="Data path")
+    parser.add_argument("-f", "--fraction", dest="sample_fraction", type=float, default=0.1, help="Sample fraction")
+    parser.add_argument("-o", "--output", dest="output_path", default="results", help="Output directory path")
+    parser.add_argument(
+        "--enable-stage-metrics",
+        action="store_true",
+        help="Enable stage metrics collection",
+    )
+    parser.add_argument(
+        "--event-log-dir",
+        default="/opt/spark/spark-events",
+        help="Event log directory (used when stage metrics enabled)",
+    )
+    return parser.parse_args()
+
+def load_sample(spark, path, fraction):
+    logger.info(f"Loading data from {path} with fraction={fraction}")    
+    
+    # Features of interest to load
+    cols = ["xyz", "Intensity", "Classification", "Red", "Green", "Blue", "Infrared"]    
+    
+    sc = spark.sparkContext
+    hadoop_conf = sc._jsc.hadoopConfiguration()
+    
+    uri = sc._jvm.java.net.URI(path)
+    fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(uri, hadoop_conf)
+    file_path = sc._jvm.org.apache.hadoop.fs.Path(path)
+    
+    all_files = [
+        str(f.getPath()) for f in fs.listStatus(file_path)
+        if str(f.getPath()).endswith(".parquet")
+    ]
+    
+    num_files = max(1, int(len(all_files) * fraction))
+    selected_files = sorted(all_files)[:num_files]
+    
+    logger.info(f"Loading {num_files}/{len(all_files)} files ({fraction*100:.1f}%)")
+    
+    df = spark.read.parquet(*selected_files).select(*cols)
+    row_count = df.count()
+    
+    if row_count == 0:
+        raise ValueError(f"No data loaded from {path}. Check data path and fraction.")
+    
+    num_partitions = df.rdd.getNumPartitions()
+    logger.info(f"Loaded {row_count} rows, partitions: {num_partitions}")
+    return df
+
 
 def normalize_height(df):
     """
@@ -284,7 +365,7 @@ def prepare_features(df, grid_size=2.0):
     
     return df
     
-def build_ml_pipeline(feature_cols, num_trees=100, max_depth=10, use_cv=False):
+def build_ml_pipeline(feature_cols, num_trees=100, max_depth=10):
     """
     Build the ML pipeline with optional cross-validation.
     
@@ -296,12 +377,10 @@ def build_ml_pipeline(feature_cols, num_trees=100, max_depth=10, use_cv=False):
         Number of trees for Random Forest
     max_depth : int
         Maximum depth of trees
-    use_cv : bool
-        Whether to use cross-validation
     
     Returns:
     --------
-    pipeline or cross-validator
+    pipeline
     """
     # Assemble features
     assembler = VectorAssembler(
@@ -328,30 +407,6 @@ def build_ml_pipeline(feature_cols, num_trees=100, max_depth=10, use_cv=False):
     )
     
     pipeline = Pipeline(stages=[assembler, scaler, rf])
-    
-    if use_cv:
-        # Parameter grid for cross-validation
-        paramGrid = ParamGridBuilder() \
-            .addGrid(rf.numTrees, [50, 100, 150]) \
-            .addGrid(rf.maxDepth, [8, 10, 12]) \
-            .build()
-        
-        # Cross-validator
-        evaluator = MulticlassClassificationEvaluator(
-            labelCol="Classification",
-            predictionCol="prediction",
-            metricName="f1"
-        )
-        
-        cv = CrossValidator(
-            estimator=pipeline,
-            estimatorParamMaps=paramGrid,
-            evaluator=evaluator,
-            numFolds=3,
-            parallelism=4  # Parallel fold training
-        )
-        
-        return cv
     
     return pipeline
 
@@ -395,25 +450,21 @@ def evaluate_model(predictions, spark):
     class_metrics.show()
 
 def main(args):
-    grid_size = args.grid_size
-    num_trees = args.num_trees
-    max_depth = args.max_depth
+    """Main training function"""
+    logger.info("\n==============< Program Parameters >===============")
+    logger.info(f"- Data path: {args.data_path}")
+    logger.info(f"- Sample fraction: {args.sample_fraction}")
+    logger.info(f"- Executor memory: {args.executor_memory}g")
+    logger.info(f"- Driver memory: {args.driver_memory}g")
+    logger.info(f"- Executor cores: {args.executor_cores}")
+    logger.info(f"- Number of executors: {args.num_executors}")
+    logger.info(f"- Output path: {args.output_path}")
+    logger.info("=================================================\n")
 
-    print("\n" + "="*50)
-    print("Program Configuration")
-    print("="*50)
-    print(f"Train files: {train_files}")
-    print(f"Valid files: {valid_files}")
-    print(f"Test files: {test_files}")
-    print(f"Grid size: {grid_size}m")
-    print(f"Random Forest trees: {num_trees}")
-    print(f"Max depth: {max_depth}")
-    print("="*50 + "\n")
+    # taskmetrics = TaskMetrics(spark)
 
     # Create Spark session
-    spark = create_spark_session(
-        app_name="Land Cover Classification"
-    )
+    spark = create_spark_session(args)
         
     # taskmetrics = TaskMetrics(spark)
     
@@ -422,22 +473,18 @@ def main(args):
     print("Loading Data")
     print("="*50)
     
-    # taskmetrics.begin()
-    df_train = read_parquet_from_s3(spark, train_files, fraction=0.05)
-    # df_test = read_parquet_from_s3(spark, test_files, fraction=0.1)
+    df_train = load_sample(spark, f"{args.data_path}/train/", args.sample_fraction)
+    df_val = load_sample(spark, f"{args.data_path}/val/", args.sample_fraction)
+    df_test = load_sample(spark, f"{args.data_path}/test/", args.sample_fraction)
     
-    # Cache after loading for reuse
-    df_train = df_train.cache()
-    # df_test = df_test.cache()
-    row_count = df_train.count()
-    # taskmetrics.end()
     
-    print(f"\nLoaded {row_count:,} points")
-    # print("\n" + "="*50)
-    # print("Read Parquet Statistics")
-    # print("="*50)
-    # taskmetrics.print_report()
-    # print("="*50 + "\n")
+    train_count = df_train.count()
+    val_count = df_val.count()
+    test_count = df_test.count()
+    num_partitions = df_train.rdd.getNumPartitions()
+    rows_per_partition = train_count / num_partitions if num_partitions > 0 else 0
+    logger.info(f"Train: {train_count}, Val: {val_count}, Test: {test_count}, Partitions: {num_partitions}, Rows/partition: {rows_per_partition:.0f}")
+
     
     # Feature engineering
     print("\n" + "="*50)
@@ -461,9 +508,7 @@ def main(args):
         "grid_intensity_mean", "grid_red_mean", "grid_green_mean", "grid_blue_mean",
     ]
     
-    df_train = prepare_features(df_train, grid_size=grid_size)
-    
-    df_train.printSchema()
+    df_train = prepare_features(df_train)
     
     print(f"\nTotal features: {len(feature_cols)}")
     print("Features:", ", ".join(feature_cols))
@@ -473,12 +518,7 @@ def main(args):
     print("Building ML Pipeline")
     print("="*50)
     
-    pipeline = build_ml_pipeline(
-        feature_cols, 
-        num_trees=num_trees, 
-        max_depth=max_depth,
-        use_cv=args.use_cv
-    )
+    pipeline = build_ml_pipeline(feature_cols)
     
     # Train model
     print("\n" + "="*50)
@@ -536,42 +576,9 @@ def main(args):
     spark.stop()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description="Optimized PySpark Land Cover Classification"
-    )
-
-    parser.add_argument(
-        "--grid-size",
-        type=float,
-        required=False,
-        help="Spatial grid size in meters",
-        default=2.0
-    )
-    parser.add_argument(
-        "--num-trees",
-        type=int,
-        required=False,
-        help="Number of Random Forest trees",
-        default=100
-    )
-    parser.add_argument(
-        "--max-depth",
-        type=int,
-        required=False,
-        help="Maximum tree depth",
-        default=10
-    )
-    parser.add_argument(
-        "--use-cv",
-        action="store_true",
-        help="Use cross-validation for hyperparameter tuning"
-    )
-    parser.add_argument(
-        "--output-model",
-        required=False,
-        help="Path to save trained model",
-        default=None
-    )
+    args = parse_args()
+    setup_logging(args)
     
-    args = parser.parse_args()
+    logger.info("Starting Land Cover Classification")
     main(args)
+    logger.info("Program completed successfully")
