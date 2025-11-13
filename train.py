@@ -7,6 +7,23 @@ from pyspark.ml.classification import RandomForestClassifier
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from sparkmeasure import TaskMetrics
 
+# # Deployment Code 
+# spark-submit \
+#   --deploy-mode client \
+#   --master yarn \
+#   --conf spark.dynamicAllocation.enabled=true \
+#   --conf spark.dynamicAllocation.minExecutors=2 \
+#   --conf spark.dynamicAllocation.maxExecutors=20 \
+#   --conf spark.dynamicAllocation.initialExecutors=8 \
+#   --conf spark.executor.memory=6g \
+#   --conf spark.executor.cores=4 \
+#   --conf spark.driver.memory=4g \
+#   --packages org.apache.hadoop:hadoop-aws:3.3.1,ch.cern.sparkmeasure:spark-measure_2.12:0.27 \
+#   train.py \
+#   --data "s3a://ubs-datasets/FRACTAL/data/test/*" \
+#   --fraction 0.01 \
+#   --output "s3a://ubs-datasets/FRACTAL/results"
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
