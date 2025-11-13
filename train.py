@@ -1,4 +1,5 @@
 import argparse
+import time
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit, count, avg, stddev, min as spark_min, max as spark_max, broadcast, expr
 from pyspark.ml import Pipeline
@@ -6,23 +7,6 @@ from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.ml.classification import RandomForestClassifier
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from sparkmeasure import TaskMetrics
-
-# # Deployment Code 
-# spark-submit \
-#   --deploy-mode client \
-#   --master yarn \
-#   --conf spark.dynamicAllocation.enabled=true \
-#   --conf spark.dynamicAllocation.minExecutors=2 \
-#   --conf spark.dynamicAllocation.maxExecutors=20 \
-#   --conf spark.dynamicAllocation.initialExecutors=8 \
-#   --conf spark.executor.memory=6g \
-#   --conf spark.executor.cores=4 \
-#   --conf spark.driver.memory=4g \
-#   --packages org.apache.hadoop:hadoop-aws:3.3.1,ch.cern.sparkmeasure:spark-measure_2.12:0.27 \
-#   train.py \
-#   --data "s3a://ubs-datasets/FRACTAL/data/test/*" \
-#   --fraction 0.01 \
-#   --output "s3a://ubs-datasets/FRACTAL/results"
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -41,7 +25,7 @@ def parse_args():
     parser.add_argument("-f", "--fraction", dest="sample_fraction", type=float, default=0.1, help="Sample fraction")
     parser.add_argument("-o", "--output", dest="output_path", default="results", help="Output directory path")
     parser.add_argument("--enable-stage-metrics", action="store_true", help="Enable stage metrics collection")
-    parser.add_argument("--event-log-dir", default="/tmp/spark-events", help="Event log directory")
+    parser.add_argument("--event-log-dir", default="file:///tmp/spark-events", help="Event log directory")
     return parser.parse_args()
 
 
@@ -107,37 +91,11 @@ def compute_spectral_features(df):
     df = df.withColumn("nir_ratio", col("Infrared") / (col("color_intensity") + lit(1e-6)))
     return df
 
-
-def compute_spatial_grid_features(df, grid_size=2.0):
-    print(f"Computing spatial grid features with grid_size={grid_size}m...")
-    df = df.withColumn("grid_x", (col("x") / lit(grid_size)).cast("int"))
-    df = df.withColumn("grid_y", (col("y") / lit(grid_size)).cast("int"))
-    
-    grid_stats = df.groupBy("grid_x", "grid_y").agg(
-        count("*").alias("grid_point_count"),
-        avg("z").alias("grid_z_mean"),
-        stddev("z").alias("grid_z_std"),
-        spark_min("z").alias("grid_z_min"),
-        spark_max("z").alias("grid_z_max"),
-        avg("Intensity").alias("grid_intensity_mean"),
-        avg("Red").alias("grid_red_mean"),
-        avg("Green").alias("grid_green_mean"),
-        avg("Blue").alias("grid_blue_mean")
-    )
-    
-    grid_stats = grid_stats.fillna(0.0, subset=["grid_z_std"])
-    df = df.join(broadcast(grid_stats), ["grid_x", "grid_y"], "left")
-    df = df.withColumn("z_relative_to_grid", col("z") - col("grid_z_mean"))
-    df = df.withColumn("z_range_in_grid", col("grid_z_max") - col("grid_z_min"))
-    return df
-
-
-def prepare_features(df, grid_size=2.0):
+def prepare_features(df):
     print("Preparing features...")
     df = df.withColumn("x", col("xyz")[0]).withColumn("y", col("xyz")[1]).withColumn("z", col("xyz")[2])
     df = normalize_height(df)
     df = compute_spectral_features(df)
-    df = compute_spatial_grid_features(df, grid_size)
     df = df.na.drop(subset=["Classification"])
     return df
 
@@ -147,9 +105,12 @@ def prepare_features(df, grid_size=2.0):
 # ============================================================================
 
 def main(args):
+    overall_start = time.time()
+    
     print("\n" + "="*60)
     print("LAND COVER CLASSIFICATION - TRAINING")
     print("="*60)
+    print(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Data path: {args.data_path}")
     print(f"Sample fraction: {args.sample_fraction}")
     print(f"Executors: {args.num_executors} x {args.executor_cores} cores x {args.executor_memory}GB")
@@ -159,7 +120,9 @@ def main(args):
     spark = create_spark_session(args)
     taskmetrics = TaskMetrics(spark)
 
-    print(f"\nReading data from: {args.data_path}")
+    # ===== DATA LOADING =====
+    print(f"\n[1/5] Reading data from: {args.data_path}")
+    t_start = time.time()
     df_train = read_parquet_from_s3(spark, args.data_path)
 
     if args.sample_fraction < 1.0:
@@ -168,16 +131,23 @@ def main(args):
 
     df_train = df_train.cache()
     record_count = df_train.count()
-    print(f"Total records loaded: {record_count:,}\n")
+    t_load = time.time() - t_start
+    print(f"✓ Total records loaded: {record_count:,} ({t_load:.2f}s)\n")
 
-    df_train = prepare_features(df_train, grid_size=2.0)
+    # ===== FEATURE ENGINEERING =====
+    print("[2/5] Feature engineering")
+    t_start = time.time()
+    df_train = prepare_features(df_train)
+    t_features = time.time() - t_start
+    print(f"✓ Features prepared ({t_features:.2f}s)\n")
 
+    # ===== PIPELINE SETUP =====
+    print("[3/5] Building ML pipeline")
+    t_start = time.time()
     feature_cols = ["x", "y", "z_normalized", "Intensity", "Red", "Green", "Blue", "Infrared",
-                    "ndvi", "exg", "color_intensity", "nir_ratio",
-                    "grid_point_count", "grid_z_std", "z_relative_to_grid", "z_range_in_grid",
-                    "grid_intensity_mean", "grid_red_mean", "grid_green_mean", "grid_blue_mean"]
+                    "ndvi", "exg", "color_intensity", "nir_ratio"]
 
-    print(f"\nBuilding ML pipeline with {len(feature_cols)} features")
+    print(f"Using {len(feature_cols)} features")
     assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
     scaler = StandardScaler(inputCol="features", outputCol="scaled_features")
     rf = RandomForestClassifier(
@@ -188,19 +158,27 @@ def main(args):
         seed=42
     )
     pipeline = Pipeline(stages=[assembler, scaler, rf])
+    t_setup = time.time() - t_start
+    print(f"✓ Pipeline built ({t_setup:.2f}s)\n")
 
-    print("\nTraining model...")
+    # ===== MODEL TRAINING =====
+    print("[4/5] Training Random Forest model")
+    t_start = time.time()
     taskmetrics.begin()
     model = pipeline.fit(df_train)
     taskmetrics.end()
+    t_train = time.time() - t_start
+    print(f"✓ Model trained ({t_train:.2f}s = {t_train/60:.2f}min)\n")
     
     print("\n" + "="*60)
-    print("TRAINING METRICS")
+    print("TRAINING METRICS (Spark Measure)")
     print("="*60)
     taskmetrics.print_report()
     print("="*60 + "\n")
 
-    print("Making predictions...")
+    # ===== EVALUATION =====
+    print("[5/5] Evaluating model")
+    t_start = time.time()
     predictions = model.transform(df_train)
     
     evaluator = MulticlassClassificationEvaluator(
@@ -209,16 +187,39 @@ def main(args):
         metricName="f1"
     )
     f1_score = evaluator.evaluate(predictions)
+    t_eval = time.time() - t_start
+    print(f"✓ Evaluation complete ({t_eval:.2f}s)\n")
     
     print("\n" + "="*60)
     print(f"TRAINING F1-SCORE: {f1_score:.4f}")
     print("="*60 + "\n")
 
+    # ===== MODEL SAVING =====
     if args.output_path:
+        print("Saving model...")
+        t_start = time.time()
         model_path = f"{args.output_path}/model"
-        print(f"Saving model to: {model_path}")
+        print(f"Model path: {model_path}")
         model.write().overwrite().save(model_path)
-        print("Model saved successfully\n")
+        t_save = time.time() - t_start
+        print(f"✓ Model saved ({t_save:.2f}s)\n")
+
+    # ===== SUMMARY =====
+    total_time = time.time() - overall_start
+    print("\n" + "="*60)
+    print("TIMING SUMMARY")
+    print("="*60)
+    print(f"Data Loading:        {t_load:8.2f}s ({t_load/total_time*100:5.1f}%)")
+    print(f"Feature Engineering: {t_features:8.2f}s ({t_features/total_time*100:5.1f}%)")
+    print(f"Pipeline Setup:      {t_setup:8.2f}s ({t_setup/total_time*100:5.1f}%)")
+    print(f"Model Training:      {t_train:8.2f}s ({t_train/total_time*100:5.1f}%)")
+    print(f"Evaluation:          {t_eval:8.2f}s ({t_eval/total_time*100:5.1f}%)")
+    if args.output_path:
+        print(f"Model Saving:        {t_save:8.2f}s ({t_save/total_time*100:5.1f}%)")
+    print("-" * 60)
+    print(f"TOTAL TIME:          {total_time:8.2f}s = {total_time/60:.2f} minutes")
+    print(f"Finished at:         {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*60 + "\n")
 
     spark.stop()
     print("Training completed successfully!")
