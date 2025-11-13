@@ -20,7 +20,9 @@ from datetime import datetime
 
 def create_spark_session(args):
     """Create and configure Spark session"""
-    app_name = args.experiment_name or f"fractal-rf-e{args.executor_memory}g-x{args.num_executors}-f{args.sample_fraction}"
+    app_name = f"fractal-run-x{args.num_executors}-executors-mem-{args.executor_memory}-g-data-{args.sample_fraction}-fraction"
+    
+    print(args)
     
     logger.info(f"Creating Spark session: {app_name}")
     builder = SparkSession.builder.appName(app_name)
@@ -37,16 +39,16 @@ def create_spark_session(args):
             "spark.hadoop.fs.s3a.aws.credentials.provider",
             "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
         )
-        .config("spark.executor.memory", f"{args.executor_memory}g")
-        .config("spark.executor.cores", str(args.executor_cores))
-        .config("spark.driver.memory", f"{args.driver_memory}g")
-        .config("spark.driver.maxResultSize", "512m")
-        .config("spark.executor.instances", str(args.num_executors))
+        .config("spark.executor.instances", str(args.num_executors)) # Number of executors
+        .config("spark.executor.cores", str(args.executor_cores)) # Number of cores per executor
+        .config("spark.executor.memory", f"{args.executor_memory}g") # Executor memory in GB
+        .config("spark.driver.memory", f"{args.driver_memory}g") # Driver memory in GB
+        .config("spark.driver.maxResultSize", "512m") # Max result size for driver
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-        .config("spark.sql.shuffle.partitions", str((args.executor_cores * args.num_executors) * 4))
+        .config("spark.sql.shuffle.partitions", str((args.executor_cores * args.num_executors) * 4)) # 4 partitions per core
         .config("spark.sql.files.maxPartitionBytes", "268435456")  # 256MB
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "134217728")  # 128MB
+        .config("spark.sql.adaptive.enabled", "true") #https://spark.apache.org/docs/latest/sql-performance-tuning.html
+        .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "134217728")
         .config("spark.hadoop.fs.s3a.connection.timeout", "50000") \
         .config("spark.hadoop.fs.s3a.threads.keepalivetime", "60000") \
         .config("spark.hadoop.fs.s3a.multipart.purge.age", "30000000") \
@@ -64,14 +66,7 @@ def create_spark_session(args):
 
     return session
 
-# Configuration
-train_files = "s3a://ubs-datasets/FRACTAL/data/train/"
-valid_files = "s3a://ubs-datasets/FRACTAL/data/valid/"
-test_files = "s3a://ubs-datasets/FRACTAL/data/test/"
-default_parq_file = "s3a://ubs-datasets/FRACTAL/data/test/TEST-1176_6137-009200000.parquet"
-
 logger = logging.getLogger(__name__)
-
 
 def setup_logging(args):
     """Setup logging configuration"""
@@ -79,7 +74,7 @@ def setup_logging(args):
     safe_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_name = args.experiment_name or f"fractal-rf-e{args.executor_memory}g-x{args.num_executors}-f{args.sample_fraction}"
+    log_name = f"fractal-run-x{args.num_executors}-executors-mem-{args.executor_memory}-g-data-{args.sample_fraction}-fraction"
     log_file = safe_dir / f"{log_name}_{timestamp}.log"
 
     command_line = ' '.join(sys.argv)
@@ -101,13 +96,12 @@ def setup_logging(args):
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("-n", "--experiment-name", default=None, help="Experiment name for Spark app")
     parser.add_argument("-m", "--master", default=None, help="Spark master URL")
     parser.add_argument("-e", "--executor-memory", type=int, default=8, help="Executor memory in GB")
-    parser.add_argument("-d", "--driver-memory", type=int, default=2, help="Driver memory in GB")
+    parser.add_argument("-d", "--driver-memory", type=int, default=4, help="Driver memory in GB")
     parser.add_argument("-c", "--executor-cores", type=int, default=2, help="Executor cores")
-    parser.add_argument("-x", "--num-executors", type=int, default=2, help="Number of executors")
-    parser.add_argument("-p", "--data", dest="data_path", default="/opt/spark/work-dir/data/FRACTAL", help="Data path")
+    parser.add_argument("-x", "--num-executors", type=int, default=8, help="Number of executors")
+    parser.add_argument("-p", "--data", dest="data_path", default="s3a://ubs-datasets/FRACTAL/data", help="Data path")
     parser.add_argument("-f", "--fraction", dest="sample_fraction", type=float, default=0.1, help="Sample fraction")
     parser.add_argument("-o", "--output", dest="output_path", default="results", help="Output directory path")
     parser.add_argument(
@@ -187,61 +181,6 @@ def normalize_height(df):
     
     return df
 
-def compute_spatial_grid_features(df, grid_size=2.0):
-    """
-    Compute neighbor features using spatial grid aggregation.
-    This is fully distributed and leverages PySpark's aggregation engine.
-    
-    Parameters:
-    -----------
-    df : pyspark.sql.DataFrame
-        DataFrame with x, y, z columns
-    grid_size : float
-        Size of spatial grid cells (in meters)
-    
-    Returns:
-    --------
-    df : pyspark.sql.DataFrame
-        DataFrame with additional spatial statistics columns
-    """
-    print(f"Computing spatial grid features with grid_size={grid_size}m...")
-    
-    # Create spatial grid indices
-    df = df.withColumn("grid_x", (col("x") / lit(grid_size)).cast("int"))
-    df = df.withColumn("grid_y", (col("y") / lit(grid_size)).cast("int"))
-    
-    # Compute grid-level statistics (distributed aggregation)
-    grid_stats = df.groupBy("grid_x", "grid_y").agg(
-        count("*").alias("grid_point_count"),
-        avg("z").alias("grid_z_mean"),
-        stddev("z").alias("grid_z_std"),
-        spark_min("z").alias("grid_z_min"),
-        spark_max("z").alias("grid_z_max"),
-        avg("Intensity").alias("grid_intensity_mean"),
-        avg("Red").alias("grid_red_mean"),
-        avg("Green").alias("grid_green_mean"),
-        avg("Blue").alias("grid_blue_mean")
-    )
-    
-    # Fill nulls in stddev (when only 1 point in grid)
-    grid_stats = grid_stats.fillna(0.0, subset=["grid_z_std"])
-    
-    # Broadcast join to avoid expensive shuffling (grid stats dataframe is smaller than points dataframe)
-    df_with_grid = df.join(broadcast(grid_stats), ["grid_x", "grid_y"], "left")
-    
-    # Compute relative features
-    df_with_grid = df_with_grid.withColumn(
-        "z_relative_to_grid", 
-        col("z") - col("grid_z_mean")
-    )
-    
-    df_with_grid = df_with_grid.withColumn(
-        "z_range_in_grid",
-        col("grid_z_max") - col("grid_z_min")
-    )
-    
-    print("Spatial grid features computed successfully!")
-    return df_with_grid
 
 def compute_spectral_features(df):
     """
@@ -329,12 +268,6 @@ def prepare_features(df, grid_size=2.0):
     print("="*50)
     df = compute_spectral_features(df)
     
-    # Spatial grid features (distributed aggregation)
-    print("\n" + "="*50)
-    print("Spatial Grid Features")
-    print("="*50)
-    df = compute_spatial_grid_features(df, grid_size)
-        
     # Drop rows with null values
     df = df.na.drop(subset=["Classification"])
     
@@ -353,17 +286,12 @@ def prepare_features(df, grid_size=2.0):
         # Spectral indices
         "ndvi", "exg", "color_intensity", "nir_ratio",
         "red_norm", "green_norm", "blue_norm",
-        
-        # Spatial grid features
-        "grid_point_count", "grid_z_std", "z_relative_to_grid", "z_range_in_grid",
-        "grid_intensity_mean", "grid_red_mean", "grid_green_mean", "grid_blue_mean",
-        
     ]
     
-    print(f"\nSelecting {len(feature_cols)} essential columns (1 label + {len(feature_cols)-1} features)")
+    print(f"\nSelecting {len(feature_cols)} columns (1 label + {len(feature_cols)-1} features)")
     df = df.select(*feature_cols)
     
-    return df
+    return df, feature_cols
     
 def build_ml_pipeline(feature_cols, num_trees=100, max_depth=10):
     """
@@ -491,24 +419,7 @@ def main(args):
     print("Feature Engineering")
     print("="*50)
     
-    # Define feature columns
-    feature_cols = [
-        # Geometric features
-        "x", "y", "z_normalized", "height",
-        
-        # Raw spectral
-        "Intensity", "Red", "Green", "Blue", "Infrared",
-        
-        # Spectral indices
-        "ndvi", "exg", "color_intensity", "nir_ratio",
-        "red_norm", "green_norm", "blue_norm",
-        
-        # Spatial grid features
-        "grid_point_count", "grid_z_std", "z_relative_to_grid", "z_range_in_grid",
-        "grid_intensity_mean", "grid_red_mean", "grid_green_mean", "grid_blue_mean",
-    ]
-    
-    df_train = prepare_features(df_train)
+    df_train, feature_cols = prepare_features(df_train)
     
     print(f"\nTotal features: {len(feature_cols)}")
     print("Features:", ", ".join(feature_cols))
