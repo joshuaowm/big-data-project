@@ -7,9 +7,13 @@ from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.ml.classification import RandomForestClassifier
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from sparkmeasure import TaskMetrics
+import logging
 
 # Deployment Code
-# spark-submit   --deploy-mode client   --master yarn   --conf spark.dynamicAllocation.enabled=true   --conf spark.dynamicAllocation.minExecutors=2   --conf spark.dynamicAllocation.maxExecutors=20   --conf spark.dynamicAllocation.initialExecutors=8   --conf spark.executor.memory=6g   --conf spark.executor.cores=4   --conf spark.driver.memory=4g   --packages org.apache.hadoop:hadoop-aws:3.3.1,ch.cern.sparkmeasure:spark-measure_2.12:0.27   train.py   --data "s3a://ubs-datasets/FRACTAL/data/test/*"   --fraction 0.01   --output "s3a://ubs-datasets/FRACTAL/results"
+# spark-submit --deploy-mode client --master yarn --packages org.apache.hadoop:hadoop-aws:3.3.1,ch.cern.sparkmeasure:spark-measure_2.12:0.27 train.py --num-executors 16 --executor-cores 2 --executor-memory 8 --driver-memory 4 --data "s3a://ubs-datasets/FRACTAL/data/train" --fraction 0.01 --output "s3a://ubs-datasets/FRACTAL/results"
+
+logger = logging.getLogger(__name__)
+
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -18,7 +22,6 @@ from sparkmeasure import TaskMetrics
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("-n", "--experiment-name", default=None, help="Experiment name for Spark app")
     parser.add_argument("-m", "--master", default=None, help="Spark master URL")
     parser.add_argument("-e", "--executor-memory", type=int, default=8, help="Executor memory in GB")
     parser.add_argument("-d", "--driver-memory", type=int, default=2, help="Driver memory in GB")
@@ -34,7 +37,7 @@ def parse_args():
 
 def create_spark_session(args):
     """Create and configure Spark session"""
-    app_name = args.experiment_name or f"fractal-rf-e{args.executor_memory}g-x{args.num_executors}-f{args.sample_fraction}"
+    app_name = f"fractal-rf-e{args.executor_memory}g-x{args.num_executors}-f{args.sample_fraction}"
     print(f"Creating Spark session: {app_name}")
     builder = SparkSession.builder.appName(app_name)
 
@@ -45,10 +48,11 @@ def create_spark_session(args):
     builder = (
         builder.config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
                .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
-               .config("spark.executor.memory", f"{args.executor_memory}g")
-               .config("spark.executor.cores", str(args.executor_cores))
-               .config("spark.driver.memory", f"{args.driver_memory}g")
-               .config("spark.driver.maxResultSize", "512m")
+               .config("spark.executor.instances", str(args.num_executors)) # Number of executors
+               .config("spark.executor.cores", str(args.executor_cores)) # Number of cores per executor
+               .config("spark.executor.memory", f"{args.executor_memory}g") # Executor memory in GB
+               .config("spark.driver.memory", f"{args.driver_memory}g") # Driver memory in GB
+               .config("spark.driver.maxResultSize", "512m") # Max result size for driver
                .config("spark.executor.instances", str(args.num_executors))
                .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
                .config("spark.sql.shuffle.partitions", str((args.executor_cores * args.num_executors) * 4))
@@ -65,10 +69,39 @@ def create_spark_session(args):
     print(f"Spark session created: executors={args.num_executors}, cores={args.executor_cores}, memory={args.executor_memory}g, fraction={args.sample_fraction}")
     return session
 
+def load_sample(spark, path, fraction):
+    logger.info(f"Sampling {fraction*100}% of data")
 
-def read_parquet_from_s3(spark: SparkSession, s3_path: str):
-    print(f"Reading Parquet file from: {s3_path}")
-    return spark.read.parquet(s3_path)
+    # Features of interest to select
+    cols = ["xyz", "Intensity", "Classification", "Red", "Green", "Blue", "Infrared"]
+
+    sc = spark.sparkContext
+    hadoop_conf = sc._jsc.hadoopConfiguration()
+
+    uri = sc._jvm.java.net.URI(path)
+    fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(uri, hadoop_conf)
+    file_path = sc._jvm.org.apache.hadoop.fs.Path(path)
+
+    all_files = [
+        str(f.getPath())
+        for f in fs.listStatus(file_path)
+        if str(f.getPath()).endswith(".parquet")
+    ]
+
+    num_files = max(1, int(len(all_files) * fraction))
+    selected_files = sorted(all_files)[:num_files]
+
+    logger.info(f"Loading {num_files}/{len(all_files)} files ({fraction*100:.1f}%)")
+
+    df = spark.read.parquet(*selected_files).select(*cols)
+    row_count = df.count()
+
+    if row_count == 0:
+        raise ValueError(f"No data loaded from {path}. Check data path and fraction.")
+
+    num_partitions = df.rdd.getNumPartitions()
+    logger.info(f"Loaded {row_count} rows, partitions: {num_partitions}")
+    return df
 
 
 # ============================================================================
@@ -77,7 +110,6 @@ def read_parquet_from_s3(spark: SparkSession, s3_path: str):
 
 def normalize_height(df):
     min_z = df.agg(spark_min("z")).collect()[0][0]
-    print(f"Minimum z value: {min_z:.2f}")
     df = df.withColumn("z_normalized", col("z") - min_z)
     return df
 
@@ -115,7 +147,7 @@ def main(args):
     print("="*60)
     print(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Data path: {args.data_path}")
-    print(f"Sample fraction: {args.sample_fraction}")
+    print(f"Sample fraction: {args.sample_fraction*100:.2f}%")
     print(f"Executors: {args.num_executors} x {args.executor_cores} cores x {args.executor_memory}GB")
     print(f"Output path: {args.output_path}")
     print("="*60 + "\n")
@@ -126,13 +158,8 @@ def main(args):
     # ===== DATA LOADING =====
     print(f"\n[1/5] Reading data from: {args.data_path}")
     t_start = time.time()
-    df_train = read_parquet_from_s3(spark, args.data_path)
+    df_train = load_sample(spark, args.data_path, args.sample_fraction)
 
-    if args.sample_fraction < 1.0:
-        print(f"Sampling {args.sample_fraction*100}% of data")
-        df_train = df_train.sample(fraction=args.sample_fraction, seed=42)
-
-    df_train = df_train.cache()
     record_count = df_train.count()
     t_load = time.time() - t_start
     print(f"✓ Total records loaded: {record_count:,} ({t_load:.2f}s)\n")
