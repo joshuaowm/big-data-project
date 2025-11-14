@@ -208,7 +208,9 @@ def main(args):
     # ===== DATA LOADING =====
     print(f"\n[1/5] Reading data from: {args.data_path}")
     t_start = time.time()
-    df_train = load_sample(spark, args.data_path, args.sample_fraction)
+    df_train = load_sample(spark, f"{args.data_path}/train/", args.sample_fraction)
+    df_test = load_sample(spark, f"{args.data_path}/test/", args.sample_fraction)
+    
 
     record_count = df_train.count()
     metrics["record_count"] = record_count
@@ -230,14 +232,14 @@ def main(args):
     feature_cols = ["x", "y", "z_normalized", "Intensity", "Red", "Green", "Blue", "Infrared",
                     "ndvi", "exg", "color_intensity", "nir_ratio"]
 
-    print(f"Using {len(feature_cols)} features")
+    print(f"Using {len(feature_cols)} features : {feature_cols}")
     assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
     scaler = StandardScaler(inputCol="features", outputCol="scaled_features")
     rf = RandomForestClassifier(
         featuresCol="scaled_features", 
         labelCol="Classification", 
-        numTrees=100, # Number of trees in the forest
-        maxDepth=10, # To prevent overfitting
+        numTrees=20, # Number of trees in the forest
+        maxDepth=6, # To prevent overfitting
         seed=42 # For reproducibility
     )
     pipeline = Pipeline(stages=[assembler, scaler, rf])
@@ -245,7 +247,7 @@ def main(args):
     print(f"✓ Pipeline built ({t_setup:.2f}s)\n")
 
     # ===== MODEL TRAINING =====
-    print("[4/5] Training Random Forest model")
+    print("[4/5] Training Random Forest model on training data")
     t_start = time.time()
     taskmetrics.begin()
     model = pipeline.fit(df_train)
@@ -261,9 +263,9 @@ def main(args):
     print("="*60 + "\n")
 
     # ===== EVALUATION =====
-    print("[5/5] Evaluating model")
+    print("[5/5] Evaluating model on test data")
     t_start = time.time()
-    predictions = model.transform(df_train)
+    predictions = model.transform(df_test)
     
     evaluator = MulticlassClassificationEvaluator(
         labelCol="Classification", 
