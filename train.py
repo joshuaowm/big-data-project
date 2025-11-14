@@ -222,6 +222,7 @@ def main(args):
     print("[2/5] Feature engineering")
     t_start = time.time()
     df_train = prepare_features(df_train)
+    df_test = prepare_features(df_test)
     t_features = time.time() - t_start
     metrics["t_features"] = t_features
     print(f"✓ Features prepared ({t_features:.2f}s)\n")
