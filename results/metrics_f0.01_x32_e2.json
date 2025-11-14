@@ -1,0 +1,15 @@
+{
+    "start_time": "2025-11-14 14:50:56",
+    "data_path": "s3a://ubs-datasets/FRACTAL/data",
+    "sample_fraction": 0.01,
+    "num_executors": 32,
+    "executor_cores": 2,
+    "executor_memory_gb": 12,
+    "record_count": 59109292,
+    "f1_score": 0.7469135739340474,
+    "t_load": 175.10322046279907,
+    "t_features": 4.132001638412476,
+    "t_train": 179.05694580078125,
+    "t_total_pipeline": 183.18894743919373,
+    "t_overall": 389.6613154411316
+}
